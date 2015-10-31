@@ -4,7 +4,7 @@
 
 % 1 + ((row-1) div K) * K + (col - 1) div K
 % ?MODULE == Modulo actual
-
+%http://www.blogjava.net/ivanwan/archive/2011/03/18/346552.html
 %Master Functions
 
 separateMatrixOnBlocks(Name, N, K) ->
@@ -39,6 +39,33 @@ readInputVectorFile(Device, K) ->
 			end.
 
 
+pageRank(MatrixFileName, VectorFileName, N, K, Iterations) -> 	removeAndCreateDir("MatrixBlocks"),
+								MatrixBlocks = separateMatrixOnBlocks(MatrixFileName, N, K),
+								MapSlaves = spawnMap(MatrixBlocks, N, K, []),
+							        ReduceSlaves = spawnReduce(N, []),
+								pageRankAux(VectorFileName, N, K, Iterations, 0, MapSlaves, ReduceSlaves),
+								sendByeToProcess(MapSlaves),
+								sendByeToProcess(ReduceSlaves).
+								
+
+pageRankAux(_, _, _, Iterations, Iterations,  _, _) -> ok;
+pageRankAux(VectorFileName, N, K, Iterations, Actual, MapSlaves, ReduceSlaves) -> removeAndCreateDir("VectorBlocks"),
+						 removeAndCreateDir("VectorPos"),
+						 separateVectorOnBlocks(VectorFileName, K),
+						 sendWorkToSlaves(MapSlaves),
+						 readResponseMap(length(MapSlaves)),
+						 sendWorkToReducers(ReduceSlaves),
+						 readResponseReduce(N, Actual),
+						 pageRankAux(getVectorInputName(Actual), N, K, Iterations, 1 + Actual, MapSlaves, ReduceSlaves).
+
+removeAndCreateDir(Dir) -> os:cmd("rm -Rf " ++ Dir),
+				 os:cmd("mkdir " ++ Dir).
+
+
+						
+ 
+ 
+
 %Master Utils
 
 bloquePertenece(Row, Col, N, K) -> N_K = N div K, 1 + ((Col - 1) div K) * N_K + (Row - 1) div K.
@@ -46,52 +73,80 @@ bloquePertenece(Row, Col, N, K) -> N_K = N div K, 1 + ((Col - 1) div K) * N_K + 
 bloqueVectorPertenece(Block, N, K) -> N_K = N div K, 1  + ((Block - 1) div N_K).
 
 writeTripletOnAFile(Block, Triplet) -> 
-				file:write_file(lists:concat(["block", Block, "Matrix.csv"]), 
+				file:write_file(lists:concat(["MatrixBlocks/block", Block, "Matrix.csv"]), 
 				io_lib:fwrite("~p.\n",[Triplet]), [append]).
 
 
 writeVectorPairOnAFile(Block, Pair) -> 
-					file:write_file(lists:concat(["block", Block, "Vector.csv"]), 
+					file:write_file(lists:concat(["VectorBlocks/block", Block, "Vector.csv"]), 
 					io_lib:fwrite("~p.\n",[Pair]), [append]).
 
-readResponse(0) -> ok;
-readResponse(N) ->
+readResponseReduce(0, _) -> ok;
+readResponseReduce(N, Iteration) ->
+			receive 
+				{I, V} -> writeResultValueToResultFile({I,V}, Iteration), readResponseReduce(N - 1, Iteration)
+			end.
+
+
+readResponseMap(0) -> ok;
+readResponseMap(N) ->
 	receive 
-		{I, V} -> writeResultValueToKeyFile(I, V), readResponse(N);
-		finish -> readResponse(N - 1)
+		{I, V} -> writeResultValueToKeyFile(I, V), readResponseMap(N);
+		finish -> readResponseMap(N - 1)
 	end.
 
 
-writeResultValueToKeyFile(Key, Value) -> file:write_file(lists:concat(["Vector", Key, "Pos.csv"]), 
+writeResultValueToResultFile(Value, Iteration) -> file:write_file(getVectorInputName(Iteration), 
+				io_lib:fwrite("~p.\n",[Value]), [append]).
+
+getVectorInputName(Iteration) -> lists:concat(["VectorInput", Iteration, ".csv"]).
+
+writeResultValueToKeyFile(Key, Value) -> file:write_file(lists:concat(["VectorPos/Vector", Key, "Pos.csv"]), 
 				io_lib:fwrite("~p.\n",[Value]), [append]).
  	
 sendWorkToSlaves([]) -> ok;
 sendWorkToSlaves([S|H]) -> S ! work, sendWorkToSlaves(H).
 
+sendByeToProcess([]) -> ok;
+sendByeToProcess([H|T]) -> H ! bye, sendByeToProcess(T).
+
 
 spawnMap([], _, _, Result)-> Result;
-spawnMap([Block|T], N , K, Result) -> Args = [self(), lists:concat(["block", Block, "Matrix.csv"]), 
-			lists:concat(["block", bloqueVectorPertenece(Block, N, K), "Vector.csv"])], spawnMap(T, N, K, [spawn(?MODULE, mapFunction, Args)|Result]).
+spawnMap([Block|T], N , K, Result) -> Args = [self(), lists:concat(["MatrixBlocks/block", Block, "Matrix.csv"]), 
+			lists:concat(["VectorBlocks/block", bloqueVectorPertenece(Block, N, K), "Vector.csv"])], spawnMap(T, N, K, [spawn(?MODULE, mapFunction, Args)|Result]).
+
+
+sendWorkToReducers([]) -> ok;
+sendWorkToReducers([H|T]) -> H ! work, sendWorkToReducers(T).
 				
+
+spawnReduce(0, Result) -> Result;
+spawnReduce(N, Result) -> spawnReduce(N - 1, [spawn(?MODULE, reduceFunction, [self(), lists:concat(["VectorPos/Vector", N, "Pos.csv"]), N])|Result]).
 
 %Slave Reduce Task
 
-reduceFunction(Values, Master) -> Master ! reduce(Values, #{}).
+reduceFunction(Master, VectorFileName, N) -> 
+			receive
+				work -> Value = readVectorFileReduce(VectorFileName), Master ! {N, Value}, reduceFunction(Master, VectorFileName, N);
+				bye -> ok
+			end. 
 
+readVectorFileReduce(FileName) -> {ok, Device} = file:open(FileName, [read]),
+				  readVectorFileReduceAux(Device, 0).
 
-reduce([], M) -> maps:to_list(M);
-reduce([{K,V}|T], M) -> reduce(T, M#{K => reduceAux(V,0)}).
-
-reduceAux([], S) -> S;
-reduceAux([H|T], S) -> reduceAux(T, S + H).
-
+readVectorFileReduceAux(Device, Acumulator) ->
+				case io:get_line(Device, "") of
+					eof -> file:close(Device), Acumulator;
+					Line -> Value = stringToAtom(Line), readVectorFileReduceAux(Device, Acumulator + Value)
+				end.
+				 
 
 
 %Slave Map Task
 
 mapFunction(Master, MatrixFileName, VectorFileName) -> 
 	receive
-		work -> Master ! readMatrixFile(MatrixFileName, readVectorFile(VectorFileName), Master);
+		work -> Master ! readMatrixFile(MatrixFileName, readVectorFile(VectorFileName), Master), mapFunction(Master, MatrixFileName, VectorFileName);
 		bye -> ok
 	end.
 
@@ -116,7 +171,7 @@ readMatrixFileAux(Device, Vector, Master) ->
     case io:get_line(Device, "") of
         eof  -> file:close(Device), finish;
         Line -> {I,J,V} = stringToAtom(Line),
-		Master ! {J, V * maps:get(J, Vector)},
+		Master ! {I, V * maps:get(J, Vector)},
 		readMatrixFileAux(Device, Vector, Master) 
 		
     end.

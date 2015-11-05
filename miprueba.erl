@@ -7,6 +7,10 @@
 %http://www.blogjava.net/ivanwan/archive/2011/03/18/346552.html
 %Master Functions
 
+%sshfs -p 22 mcalvo@192.168.0.3:/home/mcalvo/pageRankFolder ~/pageRankFolder -oauto_cache,reconnect
+
+-define(FOLDER, "/home/mcalvo/pageRankFolder/").
+
 separateMatrixOnBlocks(Name, N, K) ->
     {ok, Device} = file:open(Name,[read]),   
     readInputMatrixFile(Device, 1, N, K, sets:new()).
@@ -39,18 +43,20 @@ readInputVectorFile(Device, K) ->
 			end.
 
 
-pageRank(MatrixFileName, VectorFileName, N, K, Iterations) -> 	removeAndCreateDir("MatrixBlocks"),
+pageRank(MatrixFileName, VectorFileName, N, K, Iterations, Beta, Nodes) ->	
+								removeAndCreateDir(?FOLDER ++ "MatrixBlocks"),
 								MatrixBlocks = separateMatrixOnBlocks(MatrixFileName, N, K),
-								MapSlaves = spawnMap(MatrixBlocks, N, K, []),
-							        ReduceSlaves = spawnReduce(N, []),
+								MapSlaves = spawnMap(MatrixBlocks, Nodes, 1, N, K, []),
+							        ReduceSlaves = spawnReduce(1, (N div K) + 1, 1, K, {Beta, N}, Nodes, 1, []),
 								pageRankAux(VectorFileName, N, K, Iterations, 0, MapSlaves, ReduceSlaves),
 								sendByeToProcess(MapSlaves),
 								sendByeToProcess(ReduceSlaves).
 								
 
 pageRankAux(_, _, _, Iterations, Iterations,  _, _) -> ok;
-pageRankAux(VectorFileName, N, K, Iterations, Actual, MapSlaves, ReduceSlaves) -> removeAndCreateDir("VectorBlocks"),
-						 removeAndCreateDir("VectorPos"),
+pageRankAux(VectorFileName, N, K, Iterations, Actual, MapSlaves, ReduceSlaves) -> 
+						 removeAndCreateDir(?FOLDER ++ "VectorBlocks"),
+						 removeAndCreateDir(?FOLDER ++ "VectorPos"),
 						 separateVectorOnBlocks(VectorFileName, K),
 						 sendWorkToSlaves(MapSlaves),
 						 readResponseMap(length(MapSlaves)),
@@ -73,12 +79,12 @@ bloquePertenece(Row, Col, N, K) -> N_K = N div K, 1 + ((Col - 1) div K) * N_K + 
 bloqueVectorPertenece(Block, N, K) -> N_K = N div K, 1  + ((Block - 1) div N_K).
 
 writeTripletOnAFile(Block, Triplet) -> 
-				file:write_file(lists:concat(["MatrixBlocks/block", Block, "Matrix.csv"]), 
+				file:write_file(lists:concat([?FOLDER ++ "MatrixBlocks/block", Block, "Matrix.csv"]), 
 				io_lib:fwrite("~p.\n",[Triplet]), [append]).
 
 
 writeVectorPairOnAFile(Block, Pair) -> 
-					file:write_file(lists:concat(["VectorBlocks/block", Block, "Vector.csv"]), 
+					file:write_file(lists:concat([?FOLDER ++ "VectorBlocks/block", Block, "Vector.csv"]), 
 					io_lib:fwrite("~p.\n",[Pair]), [append]).
 
 readResponseReduce(0, _) -> ok;
@@ -99,9 +105,9 @@ readResponseMap(N) ->
 writeResultValueToResultFile(Value, Iteration) -> file:write_file(getVectorInputName(Iteration), 
 				io_lib:fwrite("~p.\n",[Value]), [append]).
 
-getVectorInputName(Iteration) -> lists:concat(["VectorInput", Iteration, ".csv"]).
+getVectorInputName(Iteration) -> lists:concat([?FOLDER ++ "VectorInput", Iteration, ".csv"]).
 
-writeResultValueToKeyFile(Key, Value) -> file:write_file(lists:concat(["VectorPos/Vector", Key, "Pos.csv"]), 
+writeResultValueToKeyFile(Key, Value) -> file:write_file(lists:concat([?FOLDER ++ "VectorPos/Vector", Key, "Pos.csv"]), 
 				io_lib:fwrite("~p.\n",[Value]), [append]).
  	
 sendWorkToSlaves([]) -> ok;
@@ -111,33 +117,45 @@ sendByeToProcess([]) -> ok;
 sendByeToProcess([H|T]) -> H ! bye, sendByeToProcess(T).
 
 
-spawnMap([], _, _, Result)-> Result;
-spawnMap([Block|T], N , K, Result) -> Args = [self(), lists:concat(["MatrixBlocks/block", Block, "Matrix.csv"]), 
-			lists:concat(["VectorBlocks/block", bloqueVectorPertenece(Block, N, K), "Vector.csv"])], spawnMap(T, N, K, [spawn(?MODULE, mapFunction, Args)|Result]).
+spawnMap([], _, _ , _, _, Result)-> Result;
+spawnMap([Block|T], Nodes, Next, N , K, Result) -> 
+			Args = [self(), lists:concat([?FOLDER ++ "MatrixBlocks/block", Block, "Matrix.csv"]), 
+			lists:concat([?FOLDER ++ "VectorBlocks/block", bloqueVectorPertenece(Block, N, K), "Vector.csv"])], 
+			spawnMap(T, Nodes, (Next rem tuple_size(Nodes)) + 1, N, K, [spawn(element(Next, Nodes), ?MODULE, mapFunction, Args)|Result]).
+
 
 
 sendWorkToReducers([]) -> ok;
 sendWorkToReducers([H|T]) -> H ! work, sendWorkToReducers(T).
 				
 
-spawnReduce(0, Result) -> Result;
-spawnReduce(N, Result) -> spawnReduce(N - 1, [spawn(?MODULE, reduceFunction, [self(), lists:concat(["VectorPos/Vector", N, "Pos.csv"]), N])|Result]).
+spawnReduce(Number, Number, _ ,  _, _, _, _, Result) -> Result;
+spawnReduce(Number, Limit, Start, K, Parameters, Nodes, Next, Result) -> spawnReduce(Number + 1, Limit, Start + K, K, Parameters, Nodes, 
+									(Next rem tuple_size(Nodes)) + 1 ,	
+					[spawn(element(Next, Nodes), ?MODULE, reduceFunction,[self(), Start, K, Parameters])|Result]).
 
 %Slave Reduce Task
 
-reduceFunction(Master, VectorFileName, N) -> 
+reduceFunction(Master, Start, BlockSize, Parameters) -> 
 			receive
-				work -> Value = readVectorFileReduce(VectorFileName), Master ! {N, Value}, reduceFunction(Master, VectorFileName, N);
+				work -> processVectorEntries(Start, Start + BlockSize, Parameters, Master), reduceFunction(Master, Start, BlockSize, Parameters);
 				bye -> ok
 			end. 
 
-readVectorFileReduce(FileName) -> {ok, Device} = file:open(FileName, [read]),
-				  readVectorFileReduceAux(Device, 0).
+processVectorEntries(N, N, _,  _) -> ok;
+processVectorEntries(N, Limit, Parameters, Master) -> Value = readVectorFileReduce(getVectorPosFileName(N), Parameters), Master ! {N, Value}, 
+						processVectorEntries(N + 1, Limit, Parameters, Master). 
 
-readVectorFileReduceAux(Device, Acumulator) ->
+
+getVectorPosFileName(Pos) -> lists:concat([?FOLDER ++ "VectorPos/Vector", Pos, "Pos.csv"]).
+
+readVectorFileReduce(FileName, Parameters) -> {ok, Device} = file:open(FileName, [read]),
+				  readVectorFileReduceAux(Device, Parameters, 0).
+
+readVectorFileReduceAux(Device, Parameters={Beta, N}, Acumulator) ->
 				case io:get_line(Device, "") of
-					eof -> file:close(Device), Acumulator;
-					Line -> Value = stringToAtom(Line), readVectorFileReduceAux(Device, Acumulator + Value)
+					eof -> file:close(Device), (Beta * Acumulator) + (1 - Beta) / N;
+					Line -> Value = stringToAtom(Line), readVectorFileReduceAux(Device, Parameters, Acumulator + Value)
 				end.
 				 
 
@@ -146,9 +164,12 @@ readVectorFileReduceAux(Device, Acumulator) ->
 
 mapFunction(Master, MatrixFileName, VectorFileName) -> 
 	receive
-		work -> Master ! readMatrixFile(MatrixFileName, readVectorFile(VectorFileName), Master), mapFunction(Master, MatrixFileName, VectorFileName);
+		work -> Response = readMatrixFile(MatrixFileName, readVectorFile(VectorFileName), Master), 
+				   Master ! Response, mapFunction(Master, MatrixFileName, VectorFileName);
 		bye -> ok
 	end.
+
+
 
 
 readVectorFile(FileName) -> {ok, Device} = file:open(FileName, [read]),
@@ -163,9 +184,6 @@ readVectorFileAux(Device, M) ->
 
 readMatrixFile(FileName, Vector, Master) -> {ok, Device} = file:open(FileName,[read]),
 			    readMatrixFileAux(Device, Vector, Master).	
-
-
-%* maps:get(J, Vector)
 
 readMatrixFileAux(Device, Vector, Master) ->
     case io:get_line(Device, "") of

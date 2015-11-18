@@ -1,4 +1,4 @@
--module(miprueba).
+-module(pageRank).
 
 -compile(export_all).
 
